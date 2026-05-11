@@ -4,6 +4,7 @@
 #include <ESP8266HTTPClient.h>
 #include <SensirionI2cScd4x.h>
 #include <time.h>
+#include "credentials.h"
 
 // ================== CONFIGURACIÓN ==================
 #define SDA_PIN 4   // D2
@@ -23,31 +24,6 @@ SensirionI2cScd4x scd4x;
 // Timing/polling
 uint32_t lastPollMs = 0;
 uint32_t lastReadyMs = 0;
-
-// ---------------- Reportar IP al servidor -----------------
-void reportIpToServer() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  WiFiClient client;
-  HTTPClient http;
-  String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + "/api/report_ip";
-
-  if (http.begin(client, url)) {
-    http.addHeader("Content-Type", "application/json");
-    String payload = "{";
-    payload += "\"device\":\"" + String(DEVICE_ID) + "\",";
-    payload += "\"room\":\"" + selectedRoom + "\",";
-    payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-    payload += "\"port\":80";
-    payload += "}";
-    int code = http.POST(payload);
-    if (code > 0)
-      Serial.printf("📡 IP enviada al servidor -> %d\n", code);
-    else
-      Serial.printf("⚠️ Error reportando IP: %s\n", http.errorToString(code).c_str());
-    http.end();
-  }
-}
 
 // ---------------- WiFi + NTP -----------------
 void connectWiFiAndTime() {
@@ -77,8 +53,6 @@ void connectWiFiAndTime() {
   Serial.print("IP asignada: ");
   Serial.println(WiFi.localIP());
 
-  // Reportar IP una vez conectado
-  //reportIpToServer();
 }
 
 // ---------------- HTTP POST -----------------
@@ -121,7 +95,7 @@ bool postJSON(uint16_t co2, float t, float rh) {
 void startLowPowerMode() {
   // Secuencia robusta de inicio
   scd4x.stopPeriodicMeasurement();
-  delay(1);
+  delay(500);
   scd4x.setSensorAltitude(650);              // ajustá según tu altitud si querés
   scd4x.setTemperatureOffset(0);             // calibración opcional
   scd4x.setAutomaticSelfCalibrationTarget(400);
