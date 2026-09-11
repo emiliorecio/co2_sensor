@@ -7,13 +7,18 @@
 #include "credentials.h"
 
 // ================== CONFIGURACIÓN ==================
-#define SDA_PIN 4   // D2
-#define SCL_PIN 5   // D1
+#define SDA_PIN 4       // D2
+#define SCL_PIN 5       // D1
+#define SENSOR_PWR_PIN 12 // D6 - MOSFET que corta la alimentación del sensor
 //SCD40 SDA → D2 (GPIO4)
 //SCD40 SCL → D1 (GPIO5)
+//SCD40 GND → Drain del MOSFET (Source del MOSFET a GND) → Gate en D6 (GPIO12)
 
 const char* SERVER_PATH = "/api/co2";
 const char* DEVICE_ID = "esp8266-co2-salon";
+
+const uint32_t DAILY_REBOOT_MS = 24UL * 60UL * 60UL * 1000UL; // reinicio preventivo
+const uint32_t STALL_REBOOT_MS = 5UL * 60UL * 1000UL;          // sin datos -> power-cycle del sensor
 
 // Cuarto por defecto (fijo)
 String selectedRoom = "Oficina"; //Living / Dormitorio_Grande / Cocina / Oficina / Dormitorio_Ana
@@ -30,7 +35,12 @@ void connectWiFiAndTime() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Conectando WiFi");
+  uint32_t startMs = millis();
   while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - startMs > 30000UL) {
+      Serial.println("\nWiFi no conectó en 30s, reiniciando...");
+      ESP.restart();
+    }
     delay(500);
     Serial.print(".");
   }
@@ -72,16 +82,12 @@ bool postJSON(uint16_t co2, float t, float rh) {
   http.addHeader("Content-Type", "application/json");
 
   time_t now = time(nullptr);
-  String payload = "{";
-  payload += "\"device\":\"" + String(DEVICE_ID) + "\",";
-  payload += "\"room\":\"" + selectedRoom + "\",";
-  payload += "\"ts\":" + String((unsigned long)now) + ",";
-  payload += "\"co2\":" + String(co2) + ",";
-  payload += "\"t\":" + String(t, 2) + ",";
-  payload += "\"rh\":" + String(rh, 1);
-  payload += "}";
+  char payload[192];
+  snprintf(payload, sizeof(payload),
+           "{\"device\":\"%s\",\"room\":\"%s\",\"ts\":%lu,\"co2\":%u,\"t\":%.2f,\"rh\":%.1f}",
+           DEVICE_ID, selectedRoom.c_str(), (unsigned long)now, co2, t, rh);
 
-  int code = http.POST(payload);
+  int code = http.POST((uint8_t*)payload, strlen(payload));
   if (code > 0) {
     Serial.printf("POST %s -> %d\n", url.c_str(), code);
   } else {
@@ -91,8 +97,16 @@ bool postJSON(uint16_t co2, float t, float rh) {
   return code >= 200 && code < 300;
 }
 
+// ---------------- Power-cycle físico del sensor -----------------
+void powerCycleSensor() {
+  digitalWrite(SENSOR_PWR_PIN, LOW);
+  delay(200);   // asegura descarga de capacitores del sensor
+  digitalWrite(SENSOR_PWR_PIN, HIGH);
+  delay(1000);  // tiempo de arranque del SCD4x tras energizarlo
+}
+
 // ---------------- (Re)iniciar medición low-power -----------------
-void startLowPowerMode() {
+bool startLowPowerMode() {
   // Secuencia robusta de inicio
   scd4x.stopPeriodicMeasurement();
   delay(500);
@@ -103,10 +117,23 @@ void startLowPowerMode() {
   int16_t err = scd4x.startLowPowerPeriodicMeasurement();
   if (err != 0) {
     Serial.printf("**ERROR startLowPowerPeriodicMeasurement: %d\n", err);
-  } else {
-    Serial.println("SCD41 en modo Low Power (30 s).");
+    return false;
   }
+  Serial.println("SCD41 en modo Low Power (30 s).");
   lastReadyMs = millis();
+  return true;
+}
+
+// ---------------- Inicializar sensor con reintentos -----------------
+bool initSensor() {
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("Iniciando sensor (intento %d/3)...\n", attempt);
+    powerCycleSensor();
+    Wire.begin(SDA_PIN, SCL_PIN);
+    scd4x.begin(Wire, 0x62);   // librería v1.1.0
+    if (startLowPowerMode()) return true;
+  }
+  return false;
 }
 
 // ---------------- SETUP -----------------
@@ -117,11 +144,15 @@ void setup() {
   Serial.println("Iniciando...");
   Serial.println("Cuarto configurado: " + selectedRoom);
 
+  pinMode(SENSOR_PWR_PIN, OUTPUT);
+  digitalWrite(SENSOR_PWR_PIN, LOW); // sensor apagado hasta initSensor()
+
   connectWiFiAndTime();
 
-  Wire.begin(SDA_PIN, SCL_PIN);
-  scd4x.begin(Wire, 0x62);   // librería v1.1.0
-  startLowPowerMode();
+  if (!initSensor()) {
+    Serial.println("No se pudo iniciar el sensor tras varios intentos, reiniciando ESP...");
+    ESP.restart();
+  }
 
   Serial.println("Warm-up inicial...");
   // Sensirion recomienda descartar mediciones iniciales; con low power
@@ -153,10 +184,23 @@ void loop() {
       }
     }
 
-    // Salvaguarda: si no vimos una muestra "ready" en >45 s, reiniciar medición
-    if (millis() - lastReadyMs > 45000UL) {
+    // Salvaguarda: si hace mucho que no hay datos, el sensor probablemente quedó
+    // trabado en el bus I2C -> power-cycle físico (un reinicio del ESP no alcanza)
+    if (millis() - lastReadyMs > STALL_REBOOT_MS) {
+      Serial.println("⟳ Sin datos por >5 min, power-cycling sensor...");
+      if (!initSensor()) {
+        Serial.println("Sensor sigue sin responder, reinicio completo del dispositivo...");
+        ESP.restart();
+      }
+    } else if (millis() - lastReadyMs > 45000UL) {
       Serial.println("⟳ No hay datos en >45s, reiniciando medición low-power...");
       startLowPowerMode();
+    }
+
+    // Reinicio preventivo diario
+    if (millis() > DAILY_REBOOT_MS) {
+      Serial.println("⟳ Reinicio diario programado...");
+      ESP.restart();
     }
   }
 
